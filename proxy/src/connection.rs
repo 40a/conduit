@@ -170,7 +170,12 @@ impl AsyncWrite for Connection {
         match *self {
             Plain(ref mut t) => {
                 try_ready!(AsyncWrite::shutdown(t));
-                // tcp shutdown afters
+                // TCP shutdown the write side.
+                //
+                // If we're shutting down, then we definitely won't write
+                // anymore. So, we should tell the remote about this. This
+                // is relied upon in our TCP proxy, to start shutting down
+                // the pipe if one side closes.
                 TcpStream::shutdown(t, Shutdown::Write).map(Async::Ready)
             },
         }

@@ -7,7 +7,6 @@ use futures::{future, Async, Future, Poll};
 use tokio_connect::Connect;
 use tokio_core::reactor::Handle;
 use tokio_io::{AsyncRead, AsyncWrite};
-//use tokio_io::io::copy;
 
 use conduit_proxy_controller_grpc::common;
 use ctx::transport::{Client as ClientCtx, Server as ServerCtx};
@@ -82,6 +81,9 @@ impl Proxy {
 
 /// A future piping data bi-directionally to In and Out.
 struct Duplex<In, Out> {
+    half_in: HalfDuplex<In>,
+    half_out: HalfDuplex<Out>,
+    /*
     in_buf: CopyBuf,
     in_eof: bool,
     in_io: In,
@@ -90,6 +92,14 @@ struct Duplex<In, Out> {
     out_eof: bool,
     out_io: Out,
     out_shutdown: bool,
+    */
+}
+
+struct HalfDuplex<T> {
+    buf: CopyBuf,
+    is_eof: bool,
+    is_shutdown: bool,
+    io: T,
 }
 
 /// A buffer used to copy bytes from one IO to another.
@@ -111,25 +121,9 @@ where
 {
     fn new(in_io: In, out_io: Out) -> Self {
         Duplex {
-            in_buf: CopyBuf::new(),
-            in_eof: false,
-            in_io,
-            in_shutdown: false,
-            out_buf: CopyBuf::new(),
-            out_eof: false,
-            out_io,
-            out_shutdown: false,
+            half_in: HalfDuplex::new(in_io),
+            half_out: HalfDuplex::new(out_io),
         }
-    }
-
-    /// Returns true if the Duplex is completely done.
-    ///
-    /// The future may finish earlier if one side has an error.
-    fn is_done(&self) -> bool {
-        self.in_eof
-            && !self.in_buf.has_remaining()
-            && self.out_eof
-            && !self.out_buf.has_remaining()
     }
 }
 
@@ -142,59 +136,78 @@ where
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        // this is macro because we don't want to actually split the IO, as
-        // that requires a futures 'TryLock'. Instead, so that we can skip
-        // that lock, the Duplex holds the original IO, and this macro
-        // prevents duplication of code.
-        macro_rules! pipe_side {
-            ($buf:ident, $eof:ident, $shutdown:ident, $read:ident, $write:ident) => ({
-                let mut __ready = !self.$shutdown;
-                while __ready {
-                    if !self.$buf.has_remaining() && !self.$eof {
-                        self.$buf.reset();
-                        match self.$read.read_buf(&mut self.$buf)? {
-                            Async::Ready(0) => {
-                                self.$eof = true;
-                            },
-                            Async::Ready(_) => {},
-                            Async::NotReady => {
-                                __ready = false;
-                            },
-                        }
-                    }
+        // This purposefully ignores the Async part, since we don't want to
+        // return early if the first half isn't ready, but the other half
+        // could make progress.
+        self.half_in.copy_into(&mut self.half_out)?;
+        self.half_out.copy_into(&mut self.half_in)?;
 
-                    while self.$buf.has_remaining() {
-                        match self.$write.write_buf(&mut self.$buf)? {
-                            Async::Ready(0) => {
-                                return Err(write_zero());
-                            },
-                            Async::Ready(_) => {
-                            },
-                            Async::NotReady => {
-                                __ready = false;
-                                break;
-                            },
-                        }
-                    }
-
-                    if self.$eof && !self.$shutdown && !self.$buf.has_remaining() {
-                        try_ready!(self.$write.shutdown());
-                        self.$shutdown = true;
-                        __ready = false;
-                    }
-                }
-            })
-        }
-
-        pipe_side!(in_buf, in_eof, in_shutdown, in_io, out_io);
-        pipe_side!(out_buf, out_eof, out_shutdown, out_io, in_io);
-
-
-        if self.is_done() {
+        if self.half_in.is_done() && self.half_out.is_done() {
             Ok(Async::Ready(()))
         } else {
             Ok(Async::NotReady)
         }
+    }
+}
+
+impl<T> HalfDuplex<T>
+where
+    T: AsyncRead,
+{
+    fn new(io: T) -> Self {
+        Self {
+            buf: CopyBuf::new(),
+            is_eof: false,
+            is_shutdown: false,
+            io,
+        }
+    }
+
+    fn copy_into<U>(&mut self, dst: &mut HalfDuplex<U>) -> Poll<(), io::Error>
+    where
+        U: AsyncWrite,
+    {
+        loop {
+            try_ready!(self.read());
+            try_ready!(self.write_into(dst));
+
+            if self.is_eof && !dst.is_shutdown && !self.buf.has_remaining() {
+                try_ready!(dst.io.shutdown());
+                dst.is_shutdown = true;
+
+                return Ok(Async::Ready(()));
+            }
+        }
+    }
+
+    fn read(&mut self) -> Poll<(), io::Error> {
+        if !self.buf.has_remaining() && !self.is_eof {
+            self.buf.reset();
+            let n = try_ready!(self.io.read_buf(&mut self.buf));
+            if n == 0 {
+                self.is_eof = true;
+            }
+        }
+
+        Ok(Async::Ready(()))
+    }
+
+    fn write_into<U>(&mut self, dst: &mut HalfDuplex<U>) -> Poll<(), io::Error>
+    where
+        U: AsyncWrite,
+    {
+        while self.buf.has_remaining() {
+            let n = try_ready!(dst.io.write_buf(&mut self.buf));
+            if n == 0 {
+                return Err(write_zero());
+            }
+        }
+
+        Ok(Async::Ready(()))
+    }
+
+    fn is_done(&self) -> bool {
+        self.is_shutdown
     }
 }
 
